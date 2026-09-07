@@ -64,37 +64,45 @@ accelerate launch train_rgba_vae.py train \
   --val-dir /data/mixed/val \
   --output /checkpoints/krea2-rgba \
   --resolution 256 --batch-size 1 --grad-accum 4 \
-  --compatibility --allow-rgb --checkpointing
+  --ref-kl --rgb-distill --opaque-alpha --allow-rgb --checkpointing
 ```
 
 精度默认继承 Accelerate，推荐 BF16；可显式 `--precision bf16`。有效 batch = GPU 数 × 每卡 batch × 累积步数。
 默认 32,000 次成功 optimizer updates，AdamW，学习率 `1.5e-5`，5% warmup 后 cosine，梯度裁剪 1.0。每 500 步验证，每 1,000 步保存。
 256 分辨率、batch 1 是启动设置，未测量真实 Krea 显存；兼容性训练增加前向、反向及教师占用。`--checkpointing` 可减少部分激活占用，不代表固定的显存保证。
 
-## 功能开关
+## 损失与训练机制选项
 
-| 功能 | 默认 | 开启/设置 | 关闭 |
-|---|---|---|---|
-| 兼容性总开关 | 开 | `--compatibility` | `--no-compatibility`，不加载教师 |
-| 不透明输入的编码分布对齐 | `0.001` | `--ref-kl-weight 0.001` | `--ref-kl-weight 0` |
-| 旧 latent 的 RGB 解码保持 | `1.0` | `--rgb-distill-weight 1` | `--rgb-distill-weight 0` |
-| 旧 RGB latent 输出 alpha≈1 | `0.1` | `--opaque-alpha-weight 0.1` | `--opaque-alpha-weight 0` |
-| 额外 RGB 语料回放 | 未指定目录则不用 | `--rgb-replay --rgb-replay-dir /data/rgb/train` | `--no-rgb-replay` 或不指定目录 |
-| 兼容性验证 | 开，受总开关控制 | `--compat-validation` | `--no-compat-validation` |
-| 主训练集接受 RGB | 开 | `--allow-rgb` | `--no-allow-rgb` |
-| 主重建的额外 alpha L1 | `0` | `--alpha-weight 0.1` | `--alpha-weight 0` |
-| LPIPS | `0.5` | `--lpips-weight 0.5` | `--lpips-weight 0` |
-| 激活重计算 | 关 | `--checkpointing` | 不传该参数 |
+每个选项直接对应一个 loss 或一项训练行为。开关决定是否启用，`*-weight` 决定强度；独立损失开关关闭时，即使权重大于 0 也不计算该损失。权重设为 0 同样会停用对应损失。
 
-单项权重为 0 时跳过对应损失；无需编码对齐时跳过学生的额外 encoder，无需 RGB/alpha 保持时跳过学生的额外 decoder，无需 RGB 蒸馏时跳过教师 decoder。主 RGBA 编解码始终执行。
-如果所有兼容性权重都为 0，但兼容性验证仍开启，教师只为验证加载。
+| Loss | 约束对象与作用 | 默认 | 开启/调权重 | 关闭 |
+|---|---|---|---|---|
+| ABMSE | encoder + decoder；重建在随机背景上的合成颜色 | 固定权重 `1` | 始终作为主重建目标 | 不提供关闭选项 |
+| LPIPS | encoder + decoder；黑/白背景合成图的感知重建 | 权重 `0.5` | `--lpips-weight 0.5` | `--lpips-weight 0` |
+| Standard KL | encoder；posterior 相对标准高斯的正则 | 权重 `1e-6` | `--kl-weight 1e-6` | `--kl-weight 0` |
+| Reference KL | encoder；不透明输入的 posterior 对齐冻结 RGB encoder | 开，权重 `0.001` | `--ref-kl --ref-kl-weight 0.001` | `--no-ref-kl` |
+| RGB distillation MSE | decoder；同一个旧 latent 的 RGB 输出对齐原 decoder | 开，权重 `1` | `--rgb-distill --rgb-distill-weight 1` | `--no-rgb-distill` |
+| Opaque alpha MSE | decoder；旧 RGB latent 的输出 alpha 接近 `1` | 开，权重 `0.1` | `--opaque-alpha --opaque-alpha-weight 0.1` | `--no-opaque-alpha` |
+| Reconstruction alpha L1 | encoder + decoder；主样本 alpha 重建误差 | 关，权重 `0` | `--alpha-weight 0.1` | `--alpha-weight 0` |
+
+| 其他机制 | 具体调整 | 默认 | 开启 | 关闭 |
+|---|---|---|---|---|
+| 额外 RGB 回放 | 为 reference loss 分支增加普通 RGB 输入；不新增 loss | 未指定目录则不用 | `--rgb-replay --rgb-replay-dir /data/rgb/train` | `--no-rgb-replay` |
+| 原 VAE 对照验证 | 测量 RGB 解码差异、alpha 偏差、reference KL；不反向传播 | 开 | `--compat-validation` | `--no-compat-validation` |
+| 主训练集混入 RGB | RGB 补 alpha=1 后参与主重建目标 | 开 | `--allow-rgb` | `--no-allow-rgb` |
+| 激活重计算 | 以重复前向换取较少激活占用，不改变 loss | 关 | `--checkpointing` | 不传该参数 |
+
+启动日志直接打印实际启用的 loss 名称和权重，以及是否执行额外 encoder/decoder 分支。逐步日志只列出启用的训练 loss 原始值，总 `loss` 为加权和；验证指标单独命名。
+停用 Reference KL 后，跳过学生的额外 encoder；停用 RGB distillation 和 Opaque alpha 后，跳过学生的额外 decoder；停用 RGB distillation 后，训练中跳过教师 decoder。主 RGBA 编解码始终执行。
+教师是否加载由实际需求决定：上述三个 reference loss 均停用，且对照验证关闭时，不加载教师。只开启对照验证时，教师只用于验证。
 
 仅做原来的 RGBA 重建训练：
 
 ```bash
 accelerate launch train_rgba_vae.py train \
   --train-dir /data/mixed/train --val-dir /data/mixed/val \
-  --output /checkpoints/rgba-only --no-compatibility
+  --output /checkpoints/rgba-only \
+  --no-ref-kl --no-rgb-distill --no-opaque-alpha --no-compat-validation
 ```
 
 只保留旧 latent 的 RGB 解码约束，关闭编码对齐和 alpha≈1：
@@ -102,7 +110,7 @@ accelerate launch train_rgba_vae.py train \
 ```bash
 accelerate launch train_rgba_vae.py train \
   --train-dir /data/mixed/train --output /checkpoints/rgb-preserve \
-  --compatibility --ref-kl-weight 0 --rgb-distill-weight 1 --opaque-alpha-weight 0
+  --no-ref-kl --rgb-distill --rgb-distill-weight 1 --no-opaque-alpha
 ```
 
 ## 教师和 RGB 回放
@@ -175,7 +183,7 @@ accelerate launch --config_file accelerate_zero2.yaml --num_processes 4 \
 ```bash
 TRAIN_DIR=/data/mixed/train VAL_DIR=/data/mixed/val \
 OUTPUT_DIR=/checkpoints/krea2-rgba NUM_GPUS=4 GRAD_ACCUM=4 \
-bash launch_train.sh --compatibility --checkpointing
+bash launch_train.sh --ref-kl --rgb-distill --opaque-alpha --checkpointing
 ```
 
 ## 验证、保存与续训
@@ -191,7 +199,7 @@ bash launch_train.sh --compatibility --checkpointing
 预览同时保存旧 latent 的教师 RGB、学生 RGB、学生 RGBA。**这些是编码器 latent 上的兼容性代理指标，尚未覆盖 DiT 生成 latent 的全部分布。** `best/vae` 仍按主验证合成 MSE 选取，不代表该 checkpoint 的旧 DiT 兼容性最好；应结合兼容性指标及真实生成对照选模型。
 
 保持原训练参数，再附加 `--resume /checkpoints/run/checkpoint-0001000` 可恢复 optimizer master/ZeRO 分片、scheduler、RNG 和 epoch/batch 游标。world size、数据、教师指纹、训练开关/权重须一致；max-steps 也须一致。单独导出的 VAE 可能是 BF16/FP16。
-如要切换功能、改变配方或从上一版脚本的 checkpoint 迁移，用其 `vae/` 作为 `--model`，新建输出目录；不要恢复不匹配的旧训练状态。重跑旧 step 会追加日志并覆盖同名导出。
+如要切换功能、改变配方，用其 `vae/` 作为 `--model`，新建输出目录；不要恢复不匹配的旧训练状态。格式 2 的 checkpoint 可在等价 loss 设置下恢复，脚本会将保存的旧总开关转换为三个独立 loss 选项，并检查当前参数一致。更早版本需新建运行。重跑旧 step 会追加日志并覆盖同名导出。
 
 ## 独立 RGB/RGBA 编解码
 
@@ -246,7 +254,7 @@ save_image(rgb[0] * 2 - 1, "/data/old-dit-new-vae-rgb.png")
 
 ## 验证记录
 
-本地验证中，10 项 CPU 测试通过：包括真实 AVIF RGB/RGBA 文件读取、RGB 补边 alpha=1、reference KL 公式与教师冻结、兼容性分支开关、总开关禁用教师、缓存/重计算梯度一致、短训练与断点恢复逐值一致，以及 packed/raw latent 接口和独立编解码。
+本地 12 项 CPU 测试通过，覆盖真实 AVIF RGB/RGBA 文件读取、RGB 补边 alpha=1、reference KL 公式与教师冻结、独立 loss 选项及教师按需加载、缓存/重计算梯度一致、短训练与断点恢复，以及 packed/raw latent 接口和独立编解码。
 其余测试覆盖 ABMSE、RGB 通道转换保真、alpha 梯度、LPIPS 连接、全局累积采样。
 
 环境：PyTorch 2.14.0、Diffusers 0.39.0、Accelerate 1.14.0。使用缩小通道数的真实 QwenImage 架构和合成图片，LPIPS 使用随机 AlexNet 以避免下载，仅验证连接。

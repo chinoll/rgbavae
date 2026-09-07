@@ -33,7 +33,7 @@ BASE_MODEL = "krea/Krea-2-Turbo"
 BASE_REVISION = "98e0fe118d17c9e3547fbb2e25acdbae2cadf7c7"
 IMAGE_SUFFIXES = {".png", ".webp", ".tif", ".tiff", ".avif", ".jpg", ".jpeg", ".bmp"}
 RGB_SUFFIXES = IMAGE_SUFFIXES
-TRAINING_FORMAT = 2
+TRAINING_FORMAT = 3
 
 
 def write_json(path, data):
@@ -347,7 +347,14 @@ class ReconstructionLoss(nn.Module):
         kl = 0.5 * (mu.square() + logvar.exp() - 1 - logvar).mean()
         alpha_l1 = ((pred[:, 3:4].float() - target[:, 3:4].float()) * 0.5).abs().mean()
         loss = reconstruction + self.lpips_weight * perceptual + self.kl_weight * kl + self.alpha_weight * alpha_l1
-        return loss, {"abmse": reconstruction, "lpips": perceptual, "kl": kl, "alpha_l1": alpha_l1}
+        parts = {"abmse": reconstruction}
+        if self.lpips_weight:
+            parts["lpips"] = perceptual
+        if self.kl_weight:
+            parts["kl_standard"] = kl
+        if self.alpha_weight:
+            parts["alpha_l1"] = alpha_l1
+        return loss, parts
 
 
 def autocast_context(device, precision):
@@ -462,12 +469,29 @@ def save_checkpoint(accelerator, model, args, step, epoch, next_batch, best):
     accelerator.print(f"Saved {folder}", flush=True)
 
 
+def reference_loss_weights(args):
+    """Resolve each loss independently; a disabled flag overrides its weight."""
+    return {name: getattr(args, f"{name}_weight") if getattr(args, name) else 0.0
+            for name in ("ref_kl", "rgb_distill", "opaque_alpha")}
+
+
+def upgrade_training_args(saved):
+    """Map the old checkpoint switch to equivalent individual loss settings."""
+    saved = dict(saved)
+    if saved.get("training_format") == 2:
+        enabled = saved.pop("compatibility")
+        saved.update(ref_kl=enabled, rgb_distill=enabled, opaque_alpha=enabled,
+                     compat_validation=enabled and saved["compat_validation"], training_format=TRAINING_FORMAT)
+    if saved.get("training_format") != TRAINING_FORMAT:
+        raise ValueError("Unsupported training format: start a new run with --model OLD/vae and --reference-model ORIGINAL_RGB_VAE.")
+    return saved
+
+
 def train(args):
     args.training_format = TRAINING_FORMAT
-    weights = {"ref_kl": args.ref_kl_weight, "rgb_distill": args.rgb_distill_weight,
-               "opaque_alpha": args.opaque_alpha_weight}
-    active_compat = args.compatibility and any(weights.values())
-    need_reference = args.compatibility and (active_compat or args.compat_validation)
+    weights = reference_loss_weights(args)
+    active_compat = any(weights.values())
+    need_reference = active_compat or args.compat_validation
     align_encoder = active_compat and weights["ref_kl"] > 0
     preserve_decoder = active_compat and (weights["rgb_distill"] > 0 or weights["opaque_alpha"] > 0)
     accelerator = Accelerator(
@@ -555,9 +579,7 @@ def train(args):
         args.reference_fingerprint = digest.hexdigest()
     progress = None
     if args.resume:
-        saved_args = json.loads((Path(args.resume) / "training_args.json").read_text())
-        if saved_args.get("training_format") != TRAINING_FORMAT:
-            raise ValueError("Old training format: start a new run with --model OLD/vae and --reference-model ORIGINAL_RGB_VAE.")
+        saved_args = upgrade_training_args(json.loads((Path(args.resume) / "training_args.json").read_text()))
         may_change = {"resume", "output", "device", "workers", "log_every", "save_every", "val_every", "val_samples"}
         for key, value in saved_args.items():
             if key not in may_change and getattr(args, key, None) != value:
@@ -601,8 +623,12 @@ def train(args):
     accelerator.print(f"Backend={accelerator.distributed_type}, precision={args.precision}, world={args.world_size}, "
                       f"train={len(files)}, val={len(val_files)}, effective_batch={args.batch_size*args.grad_accum*args.world_size}, "
                       f"epoch_padding={len(sampler)-len(dataset)}", flush=True)
-    accelerator.print(f"Compatibility={args.compatibility}, active_losses={weights if active_compat else {}}, "
-                      f"RGB_replay={len(replay_files)}, mixed_RGB={args.allow_rgb}", flush=True)
+    loss_weights = {"abmse": 1.0, "lpips": args.lpips_weight, "kl_standard": args.kl_weight,
+                    "alpha_l1": args.alpha_weight, **weights}
+    accelerator.print("Enabled loss weights: " + json.dumps({k: v for k, v in loss_weights.items() if v > 0}), flush=True)
+    accelerator.print(f"Reference_encoder_alignment={align_encoder}, old_latent_decoder_replay={preserve_decoder}, "
+                      f"reference_validation={args.compat_validation}, reference_loaded={reference is not None}, "
+                      f"RGB_replay_images={len(replay_files)}, mixed_RGB={args.allow_rgb}", flush=True)
     started = time.time()
     optimizer.zero_grad(set_to_none=True)
     while step < args.max_steps:
@@ -656,7 +682,7 @@ def train(args):
                 metrics = [None]
                 if accelerator.is_main_process:
                     metrics[0] = validate(accelerator.unwrap_model(model).vae, val_files, args, device, step)
-                    if args.compatibility and args.compat_validation:
+                    if args.compat_validation:
                         metrics[0].update(validate_compatibility(accelerator.unwrap_model(model).vae, reference,
                                                                val_files, args, device, step, replay_val_files))
                 broadcast_object_list(metrics)
@@ -739,13 +765,17 @@ def parser():
     p.add_argument("--kl-weight", type=float, default=1e-6)
     p.add_argument("--lpips-weight", type=float, default=0.5)
     p.add_argument("--alpha-weight", type=float, default=0.0, help="Optional extra alpha L1, off by default.")
-    p.add_argument("--compatibility", action=argparse.BooleanOptionalAction, default=True,
-                   help="RGB compatibility master switch; --no-compatibility skips the reference VAE entirely.")
+    p.add_argument("--ref-kl", action=argparse.BooleanOptionalAction, default=True,
+                   help="Align the student's opaque-input encoder posterior with the frozen RGB encoder.")
+    p.add_argument("--rgb-distill", action=argparse.BooleanOptionalAction, default=True,
+                   help="Match RGB decoder outputs at the same latent from the frozen RGB encoder.")
+    p.add_argument("--opaque-alpha", action=argparse.BooleanOptionalAction, default=True,
+                   help="Apply alpha=1 MSE only to decodes of old RGB latents.")
     p.add_argument("--ref-kl-weight", type=float, default=1e-3, help="Opaque encoder reference KL; 0 disables its branch.")
     p.add_argument("--rgb-distill-weight", type=float, default=1.0, help="RGB decoder distillation at old latents; 0 disables.")
     p.add_argument("--opaque-alpha-weight", type=float, default=0.1, help="Alpha=1 at old RGB latents; 0 disables.")
     p.add_argument("--compat-validation", action=argparse.BooleanOptionalAction, default=True,
-                   help="Held-out old-latent compatibility metrics; requires the master switch.")
+                   help="Evaluate RGB decoder drift, alpha opacity and encoder KL against the frozen reference; no training loss.")
     p.add_argument("--reference-model", help="Original RGB VAE used by the DiT; defaults to --model.")
     p.add_argument("--reference-subfolder")
     p.add_argument("--reference-revision")
