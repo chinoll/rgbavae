@@ -1,6 +1,6 @@
 # Krea 2 RGBA VAE：Linux / Accelerate / DeepSpeed ZeRO-2
 
-训练 `RGBA → encoder → latent → decoder → RGBA`，支持 **AVIF、RGB/RGBA 混合训练**。兼容性训练通过冻结的原 RGB VAE，约束新 VAE 保留原 latent 的 RGB 解码能力。所有新增训练项均可关闭；训练脚本不加载 DiT 或文本编码器，不需要 caption。
+训练 `RGBA → encoder → latent → decoder → RGBA`，支持 **AVIF、RGB/RGBA 混合训练，以及先训练输入/输出层再全参微调**。兼容性训练通过冻结的原 RGB VAE，约束新 VAE 保留原 latent 的 RGB 解码能力。所有新增训练项均可关闭；训练脚本不加载 DiT 或文本编码器，不需要 caption。
 
 ## 目标与边界
 
@@ -71,6 +71,37 @@ accelerate launch train_rgba_vae.py train \
 默认 32,000 次成功 optimizer updates，AdamW，学习率 `1.5e-5`，5% warmup 后 cosine，梯度裁剪 1.0。每 500 步验证，每 1,000 步保存。
 256 分辨率、batch 1 是启动设置，未测量真实 Krea 显存；兼容性训练增加前向、反向及教师占用。`--checkpointing` 可减少部分激活占用，不代表固定的显存保证。
 
+## 先适应输入/输出层，再全参训练
+
+`--io-warmup-steps N` 开启分阶段训练，默认 `0`，即从第一步开始全参训练。`N` 必须小于 `--max-steps`，按**成功的 optimizer updates**计数；梯度累积的 microbatch 和 AMP 溢出跳过的更新不计入。
+
+| 阶段 | 更新的参数 | 学习率 |
+|---|---|---|
+| 前 N 次更新 | 仅 `encoder.conv_in`、`decoder.conv_out` 的全部 weight/bias | 恒定 `--io-warmup-lr`，省略则取 `--lr` |
+| 第 N+1 次起 | VAE 全部参数，包括上述两层 | `--lr` 配合 warmup + cosine |
+
+预热训练的是两整层，包含 RGB 与新增 alpha 对应参数。中间层、latent 的 quant/post-quant 卷积等均不更新。各项 loss 按你启用的选项在两个阶段持续生效，不随解冻自动增删。
+
+示例：先做 1,000 次输入/输出层适应，再做 31,000 次全参更新：
+
+```bash
+accelerate launch --config_file accelerate_zero2.yaml --num_processes 4 \
+  train_rgba_vae.py train \
+  --train-dir /data/mixed/train --val-dir /data/mixed/val \
+  --output /checkpoints/krea2-rgba-staged \
+  --resolution 256 --batch-size 1 --grad-accum 4 \
+  --io-warmup-steps 1000 --io-warmup-lr 5e-5 \
+  --max-steps 32000 --lr 1e-5 --warmup-ratio 0.05 \
+  --ref-kl --rgb-distill --opaque-alpha --checkpointing
+```
+
+`5e-5/1e-5` 是可调整的实验起点，尚未在完整 Krea 权重上调优。`--max-steps` 包含预热步数；`--warmup-ratio` 在启用该功能时，仅针对剩余全参阶段计算。例如上述命令，全参阶段前 1,550 次更新做学习率 warmup。预热结束会自动验证并保存 `checkpoint-0001000`，然后继续全参训练，无需重启。
+
+日志的 `stage` 表示刚完成的更新属于 `io_warmup` 还是 `full`，`next_stage` 表示下一次更新阶段，`lr_used` / `lr_next_by_group` 显示各组学习率。checkpoint 记录阶段和步数，可从预热中间、切换点或全参阶段恢复；恢复时仍使用原来的 N，不重新计数。
+
+**ZeRO-2 实现方式：** 全部参数在初始化时进入固定的 optimizer 分组。预热期间，中间层梯度在归约/裁剪前替换为零，主干组 LR 为 0，因此 AdamW weight decay 也不会改变其权重；输入层仍能通过中间网络获得梯度。结束时移除梯度屏蔽，原位清零主干 Adam 的动量、方差和 step 计数，保留输入/输出层的优化器状态。
+这是参数更新冻结：为避免动态 `requires_grad` 破坏 ZeRO 分片注册，仍会计算主干的反向传播，并分配其优化器状态，不承诺预热阶段节省显存。切换发生在完整累积组的更新边界，所有 rank 同步推进，不重建 DeepSpeed engine。
+
 ## 损失与训练机制选项
 
 每个选项直接对应一个 loss 或一项训练行为。开关决定是否启用，`*-weight` 决定强度；独立损失开关关闭时，即使权重大于 0 也不计算该损失。权重设为 0 同样会停用对应损失。
@@ -91,6 +122,7 @@ accelerate launch train_rgba_vae.py train \
 | 原 VAE 对照验证 | 测量 RGB 解码差异、alpha 偏差、reference KL；不反向传播 | 开 | `--compat-validation` | `--no-compat-validation` |
 | 主训练集混入 RGB | RGB 补 alpha=1 后参与主重建目标 | 开 | `--allow-rgb` | `--no-allow-rgb` |
 | 激活重计算 | 以重复前向换取较少激活占用，不改变 loss | 关 | `--checkpointing` | 不传该参数 |
+| 输入/输出层预热 | 前 N 次更新仅训练两端卷积，再解冻其余参数 | 关 | `--io-warmup-steps N`，可配 `--io-warmup-lr` | `--io-warmup-steps 0` |
 
 启动日志直接打印实际启用的 loss 名称和权重，以及是否执行额外 encoder/decoder 分支。逐步日志只列出启用的训练 loss 原始值，总 `loss` 为加权和；验证指标单独命名。
 停用 Reference KL 后，跳过学生的额外 encoder；停用 RGB distillation 和 Opaque alpha 后，跳过学生的额外 decoder；停用 RGB distillation 后，训练中跳过教师 decoder。主 RGBA 编解码始终执行。
@@ -199,7 +231,7 @@ bash launch_train.sh --ref-kl --rgb-distill --opaque-alpha --checkpointing
 预览同时保存旧 latent 的教师 RGB、学生 RGB、学生 RGBA。**这些是编码器 latent 上的兼容性代理指标，尚未覆盖 DiT 生成 latent 的全部分布。** `best/vae` 仍按主验证合成 MSE 选取，不代表该 checkpoint 的旧 DiT 兼容性最好；应结合兼容性指标及真实生成对照选模型。
 
 保持原训练参数，再附加 `--resume /checkpoints/run/checkpoint-0001000` 可恢复 optimizer master/ZeRO 分片、scheduler、RNG 和 epoch/batch 游标。world size、数据、教师指纹、训练开关/权重须一致；max-steps 也须一致。单独导出的 VAE 可能是 BF16/FP16。
-如要切换功能、改变配方，用其 `vae/` 作为 `--model`，新建输出目录；不要恢复不匹配的旧训练状态。格式 2 的 checkpoint 可在等价 loss 设置下恢复，脚本会将保存的旧总开关转换为三个独立 loss 选项，并检查当前参数一致。更早版本需新建运行。重跑旧 step 会追加日志并覆盖同名导出。
+如要改变配方或预热步数，用其 `vae/` 作为 `--model`，新建输出目录；不要恢复不匹配的旧训练状态。格式 2/3 的 checkpoint 可在等价 loss 设置、`--io-warmup-steps 0` 下恢复；旧训练没有分阶段预热，脚本会补齐对应设置并检查参数一致。更早版本需新建运行。重跑旧 step 会追加日志并覆盖同名导出。
 
 ## 独立 RGB/RGBA 编解码
 
@@ -254,8 +286,9 @@ save_image(rgb[0] * 2 - 1, "/data/old-dit-new-vae-rgb.png")
 
 ## 验证记录
 
-本地 12 项 CPU 测试通过，覆盖真实 AVIF RGB/RGBA 文件读取、RGB 补边 alpha=1、reference KL 公式与教师冻结、独立 loss 选项及教师按需加载、缓存/重计算梯度一致、短训练与断点恢复，以及 packed/raw latent 接口和独立编解码。
+本地 15 项 CPU 测试通过，覆盖真实 AVIF RGB/RGBA 文件读取、RGB 补边 alpha=1、reference KL 公式与教师冻结、独立 loss 选项及教师按需加载、缓存/重计算梯度一致、短训练与断点恢复，以及 packed/raw latent 接口和独立编解码。
 其余测试覆盖 ABMSE、RGB 通道转换保真、alpha 梯度、LPIPS 连接、全局累积采样。
+分阶段测试还检查预热时主干权重逐值不变（包含 AdamW weight decay）、解冻后主干开始更新、主干 Adam 状态原位清零，以及从解冻前/切换点/解冻后恢复均与连续训练参数逐值一致，包含跨 epoch 中途恢复。FP32 分片状态重置使用模拟参数组验证，不能替代真实 ZeRO-2 多卡测试。
 
 环境：PyTorch 2.14.0、Diffusers 0.39.0、Accelerate 1.14.0。使用缩小通道数的真实 QwenImage 架构和合成图片，LPIPS 使用随机 AlexNet 以避免下载，仅验证连接。
 **未运行完整 Krea 权重的 Linux CUDA/ZeRO-2 训练，未验证实际旧 DiT 画质保持和后续少样本 RGBA 生成效果。** 没有附带训练完成的 RGBA 权重。

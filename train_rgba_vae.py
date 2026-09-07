@@ -33,7 +33,7 @@ BASE_MODEL = "krea/Krea-2-Turbo"
 BASE_REVISION = "98e0fe118d17c9e3547fbb2e25acdbae2cadf7c7"
 IMAGE_SUFFIXES = {".png", ".webp", ".tif", ".tiff", ".avif", ".jpg", ".jpeg", ".bmp"}
 RGB_SUFFIXES = IMAGE_SUFFIXES
-TRAINING_FORMAT = 3
+TRAINING_FORMAT = 4
 
 
 def write_json(path, data):
@@ -448,6 +448,96 @@ def lr_schedule(step, total, warmup):
     return 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
 
 
+class IOWarmup:
+    """Freeze all parameter UPDATES except the two pixel I/O convolutions.
+
+    All parameters stay registered with autograd/ZeRO from the start. Backbone
+    gradients are replaced before reduction/clipping, and a separate optimizer
+    group has LR=0, so AdamW decay cannot change frozen weights. This preserves
+    gradient flow through the backbone to encoder.conv_in; it does not promise
+    the memory savings of requires_grad=False. No engine/optimizer is rebuilt.
+    """
+    IO_NAMES = frozenset({"vae.encoder.conv_in.weight", "vae.encoder.conv_in.bias",
+                          "vae.decoder.conv_out.weight", "vae.decoder.conv_out.bias"})
+
+    def __init__(self, model, warmup_steps, completed_steps=0):
+        self.warmup_steps = warmup_steps
+        named = dict(model.named_parameters())
+        if missing := self.IO_NAMES - named.keys():
+            raise ValueError(f"Missing expected I/O layer parameters: {sorted(missing)}")
+        self.io_params = [p for name, p in named.items() if name in self.IO_NAMES]
+        self.backbone_params = [p for name, p in named.items() if name not in self.IO_NAMES]
+        self.io_only = warmup_steps > 0 and completed_steps < warmup_steps
+        self.handles = []
+        if self.io_only:
+            # Install before accelerator.prepare(): Tensor hooks precede ZeRO's
+            # gradient-accumulator hooks. Do not modify gradients in place.
+            self.handles = [p.register_hook(lambda grad: torch.zeros_like(grad)) for p in self.backbone_params]
+
+    @property
+    def stage(self):
+        return "io_warmup" if self.io_only else "full"
+
+    @torch.no_grad()
+    def advance(self, completed_steps, base_optimizer):
+        """Call only after a successful, complete optimizer update on ALL ranks."""
+        if not self.io_only or completed_steps < self.warmup_steps:
+            return False
+        groups = [group for group in base_optimizer.param_groups if group.get("name") == "backbone"]
+        if len(groups) != 1:
+            raise RuntimeError("Optimizer lost the backbone group needed for I/O warmup.")
+        # ZeRO-2 replaces each group's params with this rank's FP32 partition.
+        # Use the underlying AdamW group, not original model parameter objects.
+        # Zero in place to preserve DeepSpeed's linked optimizer-state views.
+        for param in groups[0]["params"]:
+            state = base_optimizer.state.get(param, {})
+            for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                if key in state:
+                    state[key].zero_()
+            if "step" in state:
+                if isinstance(state["step"], torch.Tensor):
+                    state["step"].zero_()
+                else:
+                    state["step"] = 0
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        self.io_only = False
+        return True
+
+
+def validate_io_warmup_args(args):
+    if not 0 <= args.io_warmup_steps < args.max_steps:
+        raise ValueError("--io-warmup-steps must be >=0 and smaller than --max-steps.")
+    if args.io_warmup_lr is not None and (not math.isfinite(args.io_warmup_lr) or args.io_warmup_lr <= 0):
+        raise ValueError("--io-warmup-lr must be finite and positive.")
+
+
+def build_optimizer(model, args, completed_steps=0):
+    validate_io_warmup_args(args)
+    controller = IOWarmup(model, args.io_warmup_steps, completed_steps)
+    if args.io_warmup_steps:
+        groups = [{"params": controller.io_params, "name": "io"},
+                  {"params": controller.backbone_params, "name": "backbone"}]
+    else:
+        # Keep the original one-group layout for existing full-training checkpoints.
+        groups = model.parameters()
+    optimizer = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
+    full_steps = args.max_steps - args.io_warmup_steps
+    warmup = round(full_steps * args.warmup_ratio)
+    if args.io_warmup_steps:
+        io_lr = args.io_warmup_lr if args.io_warmup_lr is not None else args.lr
+        def io_schedule(n):
+            return io_lr / args.lr if n < args.io_warmup_steps else lr_schedule(n - args.io_warmup_steps, full_steps, warmup)
+        def backbone_schedule(n):
+            return 0.0 if n < args.io_warmup_steps else lr_schedule(n - args.io_warmup_steps, full_steps, warmup)
+        schedules = [io_schedule, backbone_schedule]
+    else:
+        schedules = lambda n: lr_schedule(n, full_steps, warmup)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedules)
+    return optimizer, scheduler, controller
+
+
 def export_vae(accelerator, model, folder):
     # ZeRO-2 replicates parameters; save_state below preserves FP32 optimizer masters.
     state = accelerator.get_state_dict(model)
@@ -463,7 +553,8 @@ def save_checkpoint(accelerator, model, args, step, epoch, next_batch, best):
     accelerator.save_state(str(folder / "state"))
     export_vae(accelerator, model, folder / "vae")
     if accelerator.is_main_process:
-        write_json(folder / "progress.json", {"step": step, "epoch": epoch, "next_batch": next_batch, "best": best})
+        write_json(folder / "progress.json", {"step": step, "epoch": epoch, "next_batch": next_batch, "best": best,
+                                              "next_stage": "io_warmup" if step < args.io_warmup_steps else "full"})
         write_json(folder / "training_args.json", vars(args))
     accelerator.wait_for_everyone()
     accelerator.print(f"Saved {folder}", flush=True)
@@ -481,13 +572,16 @@ def upgrade_training_args(saved):
     if saved.get("training_format") == 2:
         enabled = saved.pop("compatibility")
         saved.update(ref_kl=enabled, rgb_distill=enabled, opaque_alpha=enabled,
-                     compat_validation=enabled and saved["compat_validation"], training_format=TRAINING_FORMAT)
+                     compat_validation=enabled and saved["compat_validation"], training_format=3)
+    if saved.get("training_format") == 3:
+        saved.update(io_warmup_steps=0, io_warmup_lr=None, training_format=TRAINING_FORMAT)
     if saved.get("training_format") != TRAINING_FORMAT:
         raise ValueError("Unsupported training format: start a new run with --model OLD/vae and --reference-model ORIGINAL_RGB_VAE.")
     return saved
 
 
 def train(args):
+    validate_io_warmup_args(args)
     args.training_format = TRAINING_FORMAT
     weights = reference_loss_weights(args)
     active_compat = any(weights.values())
@@ -602,9 +696,8 @@ def train(args):
     accelerator.wait_for_everyone()
     model = TrainableVAE(vae.train().requires_grad_(True), args.checkpointing, align_encoder, preserve_decoder)
     criterion = ReconstructionLoss(args.lpips_weight, args.kl_weight, args.alpha_weight).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
-    warmup = round(args.max_steps * args.warmup_ratio)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda n: lr_schedule(n, args.max_steps, warmup))
+    optimizer, scheduler, io_warmup = build_optimizer(model, args, completed_steps=progress["step"] if progress else 0)
+    base_optimizer = optimizer  # same AdamW instance; ZeRO mutates its groups to FP32 partitions
     dataset = (CompatibilityImages(files, args.resolution, args.flip, args.seed, allow_rgb=args.allow_rgb,
                                    replay_files=replay_files) if active_compat else
                RGBAImages(files, args.resolution, args.flip, args.seed, allow_rgb=args.allow_rgb))
@@ -612,12 +705,16 @@ def train(args):
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.workers,
                         pin_memory=device.type == "cuda", generator=torch.Generator().manual_seed(args.seed))
     model, optimizer, loader, scheduler = accelerator.prepare(model, optimizer, loader, scheduler)
+    if args.io_warmup_steps and [g.get("name") for g in base_optimizer.param_groups] != ["io", "backbone"]:
+        raise RuntimeError("Accelerate/DeepSpeed changed the parameter groups required for I/O warmup.")
     if accelerator.gradient_accumulation_steps != args.grad_accum or len(loader) % args.grad_accum:
         raise ValueError("Accumulation / loader alignment changed during Accelerate preparation.")
     step, epoch, skip, best = 0, 0, 0, math.inf
     if progress:
         accelerator.load_state(str(Path(args.resume) / "state"))
         step, epoch, skip, best = (progress[k] for k in ("step", "epoch", "next_batch", "best"))
+        if progress.get("next_stage", io_warmup.stage) != io_warmup.stage:
+            raise ValueError("Checkpoint stage does not match step and --io-warmup-steps.")
     else:
         set_seed(args.seed + accelerator.process_index)
     accelerator.print(f"Backend={accelerator.distributed_type}, precision={args.precision}, world={args.world_size}, "
@@ -629,6 +726,9 @@ def train(args):
     accelerator.print(f"Reference_encoder_alignment={align_encoder}, old_latent_decoder_replay={preserve_decoder}, "
                       f"reference_validation={args.compat_validation}, reference_loaded={reference is not None}, "
                       f"RGB_replay_images={len(replay_files)}, mixed_RGB={args.allow_rgb}", flush=True)
+    accelerator.print(f"Training_stage={io_warmup.stage}, io_warmup_updates={args.io_warmup_steps}, "
+                      f"io_parameters={sum(p.numel() for p in io_warmup.io_params)}, "
+                      f"backbone_parameters={sum(p.numel() for p in io_warmup.backbone_params)}", flush=True)
     started = time.time()
     optimizer.zero_grad(set_to_none=True)
     while step < args.max_steps:
@@ -636,8 +736,13 @@ def train(args):
         sampler.set_epoch(epoch)
         loader.set_epoch(epoch)
         epoch_loader = accelerator.skip_first_batches(loader, skip) if skip else loader
+        # skip_first_batches constructs a new shard with iteration=0. Restore its
+        # epoch as well, otherwise resuming mid-epoch >0 can reset data ordering.
+        epoch_loader.set_epoch(epoch)
         logged = {}
         for index, batch in enumerate(epoch_loader, start=skip):
+            update_stage = io_warmup.stage
+            lrs_used = {group.get("name", "all"): group["lr"] for group in base_optimizer.param_groups}
             x = batch["rgba"] if active_compat else batch
             with accelerator.accumulate(model):
                 if active_compat:
@@ -673,12 +778,17 @@ def train(args):
                 continue
             scheduler.step()  # one cosine step per optimizer update, independent of world size
             step += 1
+            phase_changed = io_warmup.advance(step, base_optimizer)
+            if phase_changed:
+                accelerator.print(f"I/O warmup finished at update {step}; full VAE training begins at update {step + 1}.", flush=True)
             next_epoch, next_batch = (epoch + 1, 0) if index + 1 == len(loader) else (epoch, index + 1)
             keys = list(logged)
             means = accelerator.reduce(torch.tensor([logged[k] for k in keys], device=device), reduction="mean")
-            record = {"step": step, "epoch": epoch, "lr_next": scheduler.get_last_lr()[0],
+            record = {"step": step, "epoch": epoch, "stage": update_stage, "next_stage": io_warmup.stage,
+                      "lr_used": lrs_used, "lr_next": scheduler.get_last_lr()[0],
+                      "lr_next_by_group": {group.get("name", "all"): group["lr"] for group in base_optimizer.param_groups},
                       **dict(zip(keys, means.cpu().tolist()))}
-            if step % args.val_every == 0 or step == args.max_steps:
+            if step % args.val_every == 0 or step == args.max_steps or phase_changed:
                 metrics = [None]
                 if accelerator.is_main_process:
                     metrics[0] = validate(accelerator.unwrap_model(model).vae, val_files, args, device, step)
@@ -697,7 +807,7 @@ def train(args):
                     handle.write(json.dumps(record) + "\n")
             if step % args.log_every == 0 or step == 1 or step == args.max_steps:
                 accelerator.print(json.dumps(record) + f" elapsed={time.time()-started:.1f}s", flush=True)
-            if step % args.save_every == 0 or step == args.max_steps:
+            if step % args.save_every == 0 or step == args.max_steps or phase_changed:
                 save_checkpoint(accelerator, model, args, step, next_epoch, next_batch, best)
             logged = {}
             if step >= args.max_steps:
@@ -747,7 +857,7 @@ def inference(args):
 def parser():
     root = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = root.add_subparsers(dest="command", required=True)
-    p = commands.add_parser("train", help="Convert RGB VAE and fine-tune all weights for RGBA reconstruction.")
+    p = commands.add_parser("train", help="Fine-tune RGBA VAE, optionally adapting only I/O layers before full training.")
     p.add_argument("--model", default=BASE_MODEL)
     p.add_argument("--subfolder", default=None, help="Auto-detect local VAE folder; otherwise defaults to vae.")
     p.add_argument("--revision", default=None)
@@ -760,6 +870,10 @@ def parser():
     p.add_argument("--grad-accum", type=int, default=16)
     p.add_argument("--max-steps", type=int, default=32000, help="Optimizer updates, not microbatches.")
     p.add_argument("--lr", type=float, default=1.5e-5)
+    p.add_argument("--io-warmup-steps", type=int, default=0,
+                   help="First N successful optimizer updates train only encoder.conv_in and decoder.conv_out; 0 disables.")
+    p.add_argument("--io-warmup-lr", type=float, default=None,
+                   help="Constant I/O layer LR during the first stage; defaults to --lr. Full stage uses --lr + warmup/cosine.")
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--kl-weight", type=float, default=1e-6)
