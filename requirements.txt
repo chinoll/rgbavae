@@ -1,0 +1,11 @@
+# Install matching torch + torchvision for your CUDA version first (see README).
+torch>=2.6
+torchvision>=0.21
+diffusers>=0.36,<0.40
+accelerate>=1.12,<2
+# DeepSpeed is supplied by the existing Linux training environment.
+safetensors>=0.5
+huggingface-hub>=0.34
+numpy>=1.26
+Pillow>=11.3
+lpips==0.1.4
